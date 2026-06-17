@@ -25,6 +25,7 @@ func NewCmd(f *cmdutil.Factory) *cobra.Command {
 	cmd.AddCommand(NewCmdDelete(f))
 	cmd.AddCommand(NewCmdDownload(f))
 	cmd.AddCommand(NewCmdFetch(f))
+	cmd.AddCommand(NewCmdImportChunks(f))
 	cmd.AddCommand(NewCmdList(f))
 	cmd.AddCommand(NewCmdUpload(f))
 	cmd.AddCommand(NewCmdView(f))

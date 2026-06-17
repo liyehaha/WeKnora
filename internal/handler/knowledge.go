@@ -471,6 +471,60 @@ func (h *KnowledgeHandler) CreateKnowledgeFromURL(c *gin.Context) {
 	})
 }
 
+// ImportPreprocessedKnowledge godoc
+// @Summary      Import externally preprocessed chunks
+// @Description  Create a knowledge entry from caller-provided chunks without running DocReader or WeKnora chunking again.
+// @Tags         Knowledge Management
+// @Accept       json
+// @Produce      json
+// @Param        id       path      string                                    true  "Knowledge base ID"
+// @Param        request  body      types.PreprocessedKnowledgeImportRequest  true  "Preprocessed chunks import request"
+// @Success      200      {object}  map[string]interface{}                   "Created knowledge"
+// @Failure      400      {object}  errors.AppError                          "Bad request"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /knowledge-bases/{id}/knowledge/chunks [post]
+func (h *KnowledgeHandler) ImportPreprocessedKnowledge(c *gin.Context) {
+	ctx := c.Request.Context()
+	logger.Info(ctx, "Start importing preprocessed knowledge")
+
+	_, kbID, effectiveTenantID, permission, err := h.validateKnowledgeBaseAccess(c)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+	ctx = context.WithValue(ctx, types.TenantIDContextKey, effectiveTenantID)
+
+	if permission != types.OrgRoleAdmin && permission != types.OrgRoleEditor {
+		c.Error(errors.NewForbiddenError("No permission to create knowledge"))
+		return
+	}
+
+	var req types.PreprocessedKnowledgeImportRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Error(ctx, "Failed to parse preprocessed import request", err)
+		c.Error(errors.NewBadRequestError(err.Error()))
+		return
+	}
+
+	knowledge, err := h.kgService.ImportPreprocessedKnowledge(ctx, kbID, &req)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+			return
+		}
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{"kb_id": kbID})
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":         true,
+		"data":            knowledge,
+		"chunks_imported": len(req.Chunks),
+	})
+}
+
 // CreateManualKnowledge godoc
 // @Summary      手工创建知识
 // @Description  手工录入Markdown格式的知识内容

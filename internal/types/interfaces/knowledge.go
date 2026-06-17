@@ -53,6 +53,13 @@ type KnowledgeService interface {
 		payload *types.ManualKnowledgePayload,
 		channel string,
 	) (*types.Knowledge, error)
+	// ImportPreprocessedKnowledge imports externally pre-split chunks without
+	// running the built-in parser or chunker again.
+	ImportPreprocessedKnowledge(
+		ctx context.Context,
+		kbID string,
+		payload *types.PreprocessedKnowledgeImportRequest,
+	) (*types.Knowledge, error)
 	// GetKnowledgeByID retrieves knowledge by ID (uses tenant from context).
 	GetKnowledgeByID(ctx context.Context, id string) (*types.Knowledge, error)
 	// GetKnowledgeByIDOnly retrieves knowledge by ID without tenant filter (for permission resolution).

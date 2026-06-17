@@ -86,14 +86,70 @@ var ErrDuplicateURL = errors.New("URL already exists")
 // KnowledgeProcessOverrides stores per-upload parse config overrides sent as process_config.
 // When nil, the server uses the knowledge base defaults only.
 type KnowledgeProcessOverrides struct {
-	ParserEngineRules        []ParserEngineRule            `json:"parser_engine_rules,omitempty"`
-	ChunkingConfig           *ChunkingConfig               `json:"chunking_config,omitempty"`
-	EnableMultimodel         *bool                         `json:"enable_multimodel,omitempty"`
-	VLMConfig                *VLMConfig                    `json:"vlm_config,omitempty"`
-	ASRConfig                *ASRConfig                    `json:"asr_config,omitempty"`
-	QuestionGenerationConfig *QuestionGenerationConfig     `json:"question_generation_config,omitempty"`
-	GraphEnabled             *bool                         `json:"graph_enabled,omitempty"`
-	ExtractConfig            *ExtractConfig                `json:"extract_config,omitempty"`
+	ParserEngineRules        []ParserEngineRule        `json:"parser_engine_rules,omitempty"`
+	ChunkingConfig           *ChunkingConfig           `json:"chunking_config,omitempty"`
+	EnableMultimodel         *bool                     `json:"enable_multimodel,omitempty"`
+	VLMConfig                *VLMConfig                `json:"vlm_config,omitempty"`
+	ASRConfig                *ASRConfig                `json:"asr_config,omitempty"`
+	QuestionGenerationConfig *QuestionGenerationConfig `json:"question_generation_config,omitempty"`
+	GraphEnabled             *bool                     `json:"graph_enabled,omitempty"`
+	ExtractConfig            *ExtractConfig            `json:"extract_config,omitempty"`
+}
+
+// PreprocessedKnowledgeImportRequest imports caller-provided chunks without
+// running the server-side document parser or chunker again.
+type PreprocessedKnowledgeImportRequest struct {
+	Document PreprocessedKnowledgeDocument `json:"document"`
+	Chunks   []PreprocessedChunk           `json:"chunks"`
+	Title    string                        `json:"title,omitempty"`
+	FileName string                        `json:"file_name,omitempty"`
+	TagID    string                        `json:"tag_id,omitempty"`
+	Channel  string                        `json:"channel,omitempty"`
+}
+
+type PreprocessedKnowledgeDocument struct {
+	DocID      string         `json:"doc_id"`
+	SourceFile string         `json:"source_file"`
+	SourcePath string         `json:"source_path"`
+	Title      string         `json:"title,omitempty"`
+	DocTitle   string         `json:"doc_title,omitempty"`
+	DocType    string         `json:"doc_type"`
+	Product    string         `json:"product"`
+	Language   string         `json:"language"`
+	Status     string         `json:"status"`
+	Metadata   map[string]any `json:"metadata,omitempty"`
+}
+
+type PreprocessedChunk struct {
+	ChunkID        string           `json:"chunk_id"`
+	DocID          string           `json:"doc_id"`
+	SourceFile     string           `json:"source_file"`
+	SourcePath     string           `json:"source_path"`
+	HeadingPath    string           `json:"heading_path"`
+	DocType        string           `json:"doc_type"`
+	Product        string           `json:"product"`
+	Module         string           `json:"module"`
+	Intent         string           `json:"intent"`
+	Status         string           `json:"status"`
+	Language       string           `json:"language"`
+	Title          string           `json:"title"`
+	Summary        string           `json:"summary"`
+	Keywords       []string         `json:"keywords"`
+	Aliases        []string         `json:"aliases"`
+	UnitType       string           `json:"unit_type"`
+	ParentID       string           `json:"parent_id"`
+	GraphEntities  []string         `json:"graph_entities"`
+	GraphRelations []map[string]any `json:"graph_relations"`
+	Content        string           `json:"content"`
+	Metadata       map[string]any   `json:"metadata,omitempty"`
+}
+
+type PreprocessedKnowledgeImportResponse struct {
+	Success        bool      `json:"success"`
+	Data           Knowledge `json:"data"`
+	ChunksImported int       `json:"chunks_imported"`
+	Code           string    `json:"code"`
+	Message        string    `json:"message"`
 }
 
 // CreateKnowledgeFromFile creates a knowledge entry from a local file path
@@ -527,7 +583,7 @@ func (c *Client) ReparseKnowledge(ctx context.Context, knowledgeID string) (*Kno
 //   - pending      — task has not started
 //   - processing   — DocReader / chunking / embedding stage
 //   - finalizing   — primary parse done, enrichment subtasks (summary,
-//                    question generation, graph extract) still running
+//     question generation, graph extract) still running
 //
 // Returns an error when the knowledge is in a terminal state
 // (completed, failed) or already being deleted.
@@ -724,6 +780,26 @@ func (c *Client) CreateManualKnowledge(ctx context.Context, knowledgeBaseID stri
 	}
 
 	return &response.Data, nil
+}
+
+// ImportPreprocessedKnowledge imports pre-split chunks as a completed knowledge entry.
+func (c *Client) ImportPreprocessedKnowledge(
+	ctx context.Context,
+	knowledgeBaseID string,
+	request *PreprocessedKnowledgeImportRequest,
+) (*Knowledge, int, error) {
+	path := fmt.Sprintf("/api/v1/knowledge-bases/%s/knowledge/chunks", knowledgeBaseID)
+	resp, err := c.doRequest(ctx, http.MethodPost, path, request, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var response PreprocessedKnowledgeImportResponse
+	if err := parseResponse(resp, &response); err != nil {
+		return nil, 0, err
+	}
+
+	return &response.Data, response.ChunksImported, nil
 }
 
 // UpdateManualKnowledge updates a manual Markdown knowledge entry.
