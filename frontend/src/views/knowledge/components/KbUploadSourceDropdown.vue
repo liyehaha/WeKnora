@@ -61,7 +61,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, h, withDefaults } from 'vue'
+import { ref, computed, h } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { MessagePlugin, Icon as TIcon } from 'tdesign-vue-next'
 import { filterUploadFiles } from '../utils/uploadSources'
@@ -70,6 +70,7 @@ const props = withDefaults(defineProps<{
   acceptFileTypes?: string
   supportedFileTypes?: string[]
   includeManual?: boolean
+  includePreprocessed?: boolean
   triggerIcon?: string
   triggerClass?: string
   dataGuide?: string
@@ -79,6 +80,7 @@ const props = withDefaults(defineProps<{
   acceptFileTypes: '',
   supportedFileTypes: () => [],
   includeManual: false,
+  includePreprocessed: false,
   triggerIcon: 'file-add',
   triggerClass: '',
   dataGuide: '',
@@ -90,6 +92,7 @@ const emit = defineEmits<{
   files: [files: File[]]
   url: [url: string]
   manual: []
+  preprocessed: []
 }>()
 
 const { t } = useI18n()
@@ -119,6 +122,13 @@ const dropdownOptions = computed(() => {
       prefixIcon: () => h(TIcon, { name: 'link', size: '16px' }),
     },
   ]
+  if (props.includePreprocessed) {
+    options.push({
+      content: t('knowledgeBase.importPreprocessedChunks'),
+      value: 'importPreprocessed',
+      prefixIcon: () => h(TIcon, { name: 'upload', size: '16px' }),
+    })
+  }
   if (props.includeManual) {
     options.push({
       content: t('upload.onlineEdit'),
@@ -143,6 +153,9 @@ const handleActionSelect = (data: { value: string }) => {
       break
     case 'manualCreate':
       emit('manual')
+      break
+    case 'importPreprocessed':
+      emit('preprocessed')
       break
     default:
       break

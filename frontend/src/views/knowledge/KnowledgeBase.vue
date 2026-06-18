@@ -33,11 +33,17 @@ import {
   deleteKnowledgeBaseTag,
   uploadKnowledgeFile,
   createKnowledgeFromURL,
+  importPreprocessedKnowledge,
   reparseKnowledge,
   cancelKnowledgeParse,
   batchDeleteKnowledge,
   getKnowledgeSpans,
   getKnowledgeDetails,
+} from "@/api/knowledge-base/index";
+import type {
+  PreprocessedChunk,
+  PreprocessedKnowledgeDocument,
+  PreprocessedKnowledgeImportRequest,
 } from "@/api/knowledge-base/index";
 import { knowledgeSpansPayloadHasTrace } from '@/utils/knowledgeTrace';
 import FAQEntryManager from './components/FAQEntryManager.vue';
@@ -65,6 +71,13 @@ const kbId = computed(() => (route.params as any).kbId as string || '');
 const kbInfo = ref<any>(null);
 const uploadSourceRef = ref<InstanceType<typeof KbUploadSourceDropdown> | null>(null);
 const uploading = ref(false);
+const preprocessedImportVisible = ref(false);
+const preprocessedImporting = ref(false);
+const preprocessedDocumentsFile = ref<File | null>(null);
+const preprocessedChunksFile = ref<File | null>(null);
+const preprocessedDocumentsInput = ref<HTMLInputElement | null>(null);
+const preprocessedChunksInput = ref<HTMLInputElement | null>(null);
+const preprocessedImportProgress = ref({ current: 0, total: 0 });
 const kbLoading = ref(false);
 const docListLoading = ref(true);
 const isFAQ = computed(() => (kbInfo.value?.type || '') === 'faq');
@@ -442,6 +455,7 @@ const fileTypeOptions = computed(() => [
   { label: 'MD', value: 'md' },
   { label: 'URL', value: 'url' },
   { label: t('knowledgeBase.typeManual'), value: 'manual' },
+  { label: 'PREPROCESSED', value: 'preprocessed' },
   { label: 'MP3', value: 'mp3' },
   { label: 'WAV', value: 'wav' },
   { label: 'M4A', value: 'm4a' },
@@ -464,6 +478,7 @@ const sourceOptions = computed(() => [
   { label: t('knowledgeBase.sourceUpload'), value: 'web' },
   { label: t('knowledgeBase.sourceUrl'), value: 'url' },
   { label: t('knowledgeBase.sourceManual'), value: 'manual' },
+  { label: t('knowledgeBase.sourcePreprocessed'), value: 'preprocessed_chunks' },
   { label: t('knowledgeBase.sourceApi'), value: 'api' },
   { label: t('knowledgeBase.sourceBrowserExtension'), value: 'browser_extension' },
   { label: t('knowledgeBase.channelFeishu'), value: 'feishu' },
@@ -1550,6 +1565,248 @@ const executeUrlImport = async (url: string, processConfig?: KnowledgeProcessOve
   }
 };
 
+const ensurePreprocessedImportReady = () => {
+  if (isFAQ.value) {
+    MessagePlugin.warning(t('knowledgeBase.operationNotSupportedForType'));
+    return false;
+  }
+  if (!kbId.value) {
+    MessagePlugin.warning(t('knowledgeEditor.messages.missingId'));
+    return false;
+  }
+  if (!kbInfo.value) {
+    MessagePlugin.warning(t('knowledgeBase.notInitialized'));
+    return false;
+  }
+  const strategy = (kbInfo.value as any).indexing_strategy;
+  const needsEmbedding = !strategy || strategy.vector_enabled || strategy.keyword_enabled;
+  if (needsEmbedding && !kbInfo.value.embedding_model_id) {
+    MessagePlugin.warning(t('knowledgeBase.notInitialized'));
+    return false;
+  }
+  return true;
+};
+
+const resetPreprocessedImportDialog = () => {
+  preprocessedDocumentsFile.value = null;
+  preprocessedChunksFile.value = null;
+  preprocessedImportProgress.value = { current: 0, total: 0 };
+};
+
+const openPreprocessedImportDialog = () => {
+  if (!ensurePreprocessedImportReady()) return;
+  resetPreprocessedImportDialog();
+  preprocessedImportVisible.value = true;
+};
+
+const handlePreprocessedFileChange = (kind: 'documents' | 'chunks', event: Event) => {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0] || null;
+  if (!file) return;
+  const name = file.name.toLowerCase();
+  if (!name.endsWith('.jsonl') && !name.endsWith('.json')) {
+    MessagePlugin.warning(t('knowledgeBase.preprocessedFileTypeHint'));
+    input.value = '';
+    return;
+  }
+  if (kind === 'documents') {
+    preprocessedDocumentsFile.value = file;
+  } else {
+    preprocessedChunksFile.value = file;
+  }
+  input.value = '';
+};
+
+const clearPreprocessedFile = (kind: 'documents' | 'chunks') => {
+  if (preprocessedImporting.value) return;
+  if (kind === 'documents') {
+    preprocessedDocumentsFile.value = null;
+  } else {
+    preprocessedChunksFile.value = null;
+  }
+};
+
+const readJSONLFile = async <T extends Record<string, unknown>>(file: File): Promise<T[]> => {
+  const text = await file.text();
+  const rows: T[] = [];
+  const lines = text.split(/\r?\n/);
+  lines.forEach((rawLine, index) => {
+    const line = rawLine.trim();
+    if (!line) return;
+    try {
+      const value = JSON.parse(line);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('row is not an object');
+      }
+      rows.push(value as T);
+    } catch (error: any) {
+      throw new Error(t('knowledgeBase.preprocessedParseError', {
+        file: file.name,
+        line: index + 1,
+        message: error?.message || 'invalid JSON',
+      }) as string);
+    }
+  });
+  return rows;
+};
+
+const firstPreprocessedText = (...values: unknown[]) => {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+};
+
+const getPreprocessedDocId = (document: PreprocessedKnowledgeDocument) => firstPreprocessedText(
+  document.doc_id,
+  document.source_path,
+  document.source_file,
+);
+
+const getPreprocessedChunkDocId = (chunk: PreprocessedChunk) => firstPreprocessedText(
+  chunk.doc_id,
+  chunk.source_path,
+  chunk.source_file,
+  'preprocessed',
+);
+
+const synthesizePreprocessedDocument = (chunk: PreprocessedChunk): PreprocessedKnowledgeDocument => {
+  const docId = getPreprocessedChunkDocId(chunk);
+  return {
+    doc_id: docId,
+    source_file: firstPreprocessedText(chunk.source_file),
+    source_path: firstPreprocessedText(chunk.source_path),
+    title: firstPreprocessedText(chunk.source_file, chunk.title, chunk.heading_path, docId),
+    doc_type: firstPreprocessedText(chunk.doc_type),
+    product: firstPreprocessedText(chunk.product),
+    language: firstPreprocessedText(chunk.language),
+    status: firstPreprocessedText(chunk.status),
+  };
+};
+
+const buildPreprocessedImportRequests = (
+  documents: PreprocessedKnowledgeDocument[],
+  chunks: PreprocessedChunk[],
+): PreprocessedKnowledgeImportRequest[] => {
+  const docsById = new Map<string, PreprocessedKnowledgeDocument>();
+  const chunksByDocId = new Map<string, PreprocessedChunk[]>();
+  const order: string[] = [];
+  const seen = new Set<string>();
+
+  const pushOrder = (docId: string) => {
+    if (!seen.has(docId)) {
+      order.push(docId);
+      seen.add(docId);
+    }
+  };
+
+  documents.forEach((document) => {
+    const docId = getPreprocessedDocId(document);
+    if (!docId) return;
+    docsById.set(docId, {
+      ...document,
+      doc_id: docId,
+      title: firstPreprocessedText(document.title, document.doc_title),
+    });
+    pushOrder(docId);
+  });
+
+  chunks.forEach((chunk) => {
+    const docId = getPreprocessedChunkDocId(chunk);
+    const normalizedChunk = { ...chunk, doc_id: docId };
+    const list = chunksByDocId.get(docId) || [];
+    list.push(normalizedChunk);
+    chunksByDocId.set(docId, list);
+    if (!docsById.has(docId)) {
+      docsById.set(docId, synthesizePreprocessedDocument(normalizedChunk));
+    }
+    pushOrder(docId);
+  });
+
+  const tagIdToUpload = selectedTagId.value !== '__untagged__' ? selectedTagId.value : undefined;
+  return order.flatMap((docId) => {
+    const group = chunksByDocId.get(docId) || [];
+    if (!group.length) return [];
+    const document = docsById.get(docId) || synthesizePreprocessedDocument(group[0]);
+    const normalizedChunks = group.map((chunk) => ({
+      ...chunk,
+      doc_id: docId,
+      source_file: firstPreprocessedText(chunk.source_file, document.source_file),
+      source_path: firstPreprocessedText(chunk.source_path, document.source_path),
+      doc_type: firstPreprocessedText(chunk.doc_type, document.doc_type),
+      product: firstPreprocessedText(chunk.product, document.product),
+      language: firstPreprocessedText(chunk.language, document.language),
+      status: firstPreprocessedText(chunk.status, document.status),
+    }));
+    return [{
+      document,
+      chunks: normalizedChunks,
+      title: firstPreprocessedText(document.title, document.doc_title, document.source_file, document.doc_id),
+      file_name: firstPreprocessedText(document.source_file, document.title, document.doc_id),
+      tag_id: tagIdToUpload,
+      channel: 'web',
+    }];
+  });
+};
+
+const executePreprocessedImport = async () => {
+  if (!ensurePreprocessedImportReady()) return;
+  if (!preprocessedChunksFile.value) {
+    MessagePlugin.warning(t('knowledgeBase.preprocessedChunksRequired'));
+    return;
+  }
+  const targetKbId = kbId.value;
+  if (!targetKbId) return;
+
+  preprocessedImporting.value = true;
+  preprocessedImportProgress.value = { current: 0, total: 0 };
+  try {
+    const documents = preprocessedDocumentsFile.value
+      ? await readJSONLFile<PreprocessedKnowledgeDocument>(preprocessedDocumentsFile.value)
+      : [];
+    const chunks = await readJSONLFile<PreprocessedChunk>(preprocessedChunksFile.value);
+    if (!chunks.length) {
+      MessagePlugin.warning(t('knowledgeBase.preprocessedChunksEmpty'));
+      return;
+    }
+
+    const requests = buildPreprocessedImportRequests(documents, chunks);
+    if (!requests.length) {
+      MessagePlugin.warning(t('knowledgeBase.preprocessedNoImportableDocs'));
+      return;
+    }
+
+    preprocessedImportProgress.value = { current: 0, total: requests.length };
+    for (const request of requests) {
+      await importPreprocessedKnowledge(targetKbId, request);
+      preprocessedImportProgress.value = {
+        current: preprocessedImportProgress.value.current + 1,
+        total: requests.length,
+      };
+    }
+
+    preprocessedImportVisible.value = false;
+    MessagePlugin.success(t('knowledgeBase.preprocessedImportSuccess', {
+      docs: requests.length,
+      chunks: chunks.length,
+    }));
+    resetPreprocessedImportDialog();
+    window.dispatchEvent(new CustomEvent('knowledgeFileUploaded', {
+      detail: { kbId: targetKbId },
+    }));
+  } catch (error: any) {
+    MessagePlugin.error(error?.message || t('knowledgeBase.preprocessedImportFailed'));
+  } finally {
+    preprocessedImporting.value = false;
+  }
+};
+
+const handlePreprocessedDialogCancel = () => {
+  if (preprocessedImporting.value) return;
+  preprocessedImportVisible.value = false;
+  resetPreprocessedImportDialog();
+};
+
 const handleUploadConfirmResult = async (result: UploadConfirmResult) => {
   if (result.mode === 'manual') {
     return;
@@ -1976,6 +2233,108 @@ async function createNewSession(value: string): Promise<void> {
 </script>
 
 <template>
+  <t-dialog
+    v-model:visible="preprocessedImportVisible"
+    :header="$t('knowledgeBase.preprocessedImportTitle')"
+    :confirm-btn="{
+      content: preprocessedImporting ? $t('knowledgeBase.preprocessedImporting') : $t('common.confirm'),
+      theme: 'primary',
+      loading: preprocessedImporting,
+      disabled: !preprocessedChunksFile || preprocessedImporting,
+    }"
+    :cancel-btn="{ content: $t('common.cancel'), disabled: preprocessedImporting }"
+    width="560px"
+    :close-on-overlay-click="!preprocessedImporting"
+    :close-btn="!preprocessedImporting"
+    @confirm="executePreprocessedImport"
+    @cancel="handlePreprocessedDialogCancel"
+  >
+    <div class="preprocessed-import-form">
+      <p class="preprocessed-import-desc">
+        {{ $t('knowledgeBase.preprocessedImportDesc') }}
+      </p>
+      <div class="preprocessed-file-row">
+        <div class="preprocessed-file-copy">
+          <div class="preprocessed-file-label">
+            {{ $t('knowledgeBase.preprocessedDocumentsFile') }}
+          </div>
+          <div class="preprocessed-file-tip">
+            {{ $t('knowledgeBase.preprocessedDocumentsTip') }}
+          </div>
+        </div>
+        <div class="preprocessed-file-actions">
+          <t-button variant="outline" size="small" :disabled="preprocessedImporting" @click="preprocessedDocumentsInput?.click()">
+            <template #icon><t-icon name="file-add" /></template>
+            {{ preprocessedDocumentsFile ? $t('knowledgeBase.preprocessedReplaceFile') : $t('knowledgeBase.preprocessedSelectFile') }}
+          </t-button>
+          <button
+            v-if="preprocessedDocumentsFile"
+            type="button"
+            class="preprocessed-file-clear"
+            :disabled="preprocessedImporting"
+            @click="clearPreprocessedFile('documents')"
+          >
+            <t-icon name="close" size="14px" />
+          </button>
+        </div>
+      </div>
+      <div v-if="preprocessedDocumentsFile" class="preprocessed-selected-file">
+        {{ preprocessedDocumentsFile.name }}
+      </div>
+      <div class="preprocessed-file-row required">
+        <div class="preprocessed-file-copy">
+          <div class="preprocessed-file-label">
+            {{ $t('knowledgeBase.preprocessedChunksFile') }}
+          </div>
+          <div class="preprocessed-file-tip">
+            {{ $t('knowledgeBase.preprocessedChunksTip') }}
+          </div>
+        </div>
+        <div class="preprocessed-file-actions">
+          <t-button variant="outline" size="small" :disabled="preprocessedImporting" @click="preprocessedChunksInput?.click()">
+            <template #icon><t-icon name="file-add" /></template>
+            {{ preprocessedChunksFile ? $t('knowledgeBase.preprocessedReplaceFile') : $t('knowledgeBase.preprocessedSelectFile') }}
+          </t-button>
+          <button
+            v-if="preprocessedChunksFile"
+            type="button"
+            class="preprocessed-file-clear"
+            :disabled="preprocessedImporting"
+            @click="clearPreprocessedFile('chunks')"
+          >
+            <t-icon name="close" size="14px" />
+          </button>
+        </div>
+      </div>
+      <div v-if="preprocessedChunksFile" class="preprocessed-selected-file">
+        {{ preprocessedChunksFile.name }}
+      </div>
+      <div v-if="preprocessedImporting" class="preprocessed-import-progress">
+        <t-loading size="small" />
+        <span>
+          {{ $t('knowledgeBase.preprocessedImportProgress', {
+            current: preprocessedImportProgress.current,
+            total: preprocessedImportProgress.total || '-'
+          }) }}
+        </span>
+      </div>
+      <input
+        ref="preprocessedDocumentsInput"
+        type="file"
+        class="hidden-file-input"
+        accept=".jsonl,.json"
+        @change="(event) => handlePreprocessedFileChange('documents', event)"
+      />
+      <input
+        ref="preprocessedChunksInput"
+        type="file"
+        class="hidden-file-input"
+        accept=".jsonl,.json"
+        @change="(event) => handlePreprocessedFileChange('chunks', event)"
+      />
+    </div>
+  </t-dialog>
+
   <template v-if="!isFAQ">
     <div class="knowledge-layout">
       <div class="document-header">
@@ -2228,6 +2587,7 @@ async function createNewSession(value: string): Promise<void> {
                     :accept-file-types="acceptFileTypes"
                     :supported-file-types="[...supportedFileTypes]"
                     include-manual
+                    include-preprocessed
                     trigger-icon="file-add"
                     trigger-class="content-bar-icon-btn"
                     data-guide="kb-detail-add-doc"
@@ -2236,6 +2596,7 @@ async function createNewSession(value: string): Promise<void> {
                     @files="handleUploadSourceFiles"
                     @url="handleUploadSourceUrl"
                     @manual="handleManualCreate"
+                    @preprocessed="openPreprocessedImportDialog"
                   />
                 </div>
               </div>
@@ -4234,6 +4595,111 @@ async function createNewSession(value: string): Promise<void> {
     margin-top: 8px;
     line-height: 1.5;
   }
+}
+
+.hidden-file-input {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.preprocessed-import-form {
+  padding: 4px 0 0;
+}
+
+.preprocessed-import-desc {
+  margin: 0 0 16px;
+  color: var(--td-text-color-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.preprocessed-file-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 0;
+  border-top: 1px solid var(--td-component-stroke);
+
+  &.required .preprocessed-file-label::after {
+    content: '*';
+    margin-left: 4px;
+    color: var(--td-error-color);
+  }
+}
+
+.preprocessed-file-copy {
+  min-width: 0;
+}
+
+.preprocessed-file-label {
+  color: var(--td-text-color-primary);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.preprocessed-file-tip {
+  margin-top: 4px;
+  color: var(--td-text-color-placeholder);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.preprocessed-file-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.preprocessed-file-clear {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--td-text-color-placeholder);
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    color: var(--td-error-color);
+    background: var(--td-error-color-1);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+}
+
+.preprocessed-selected-file {
+  margin: -6px 0 10px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--td-bg-color-secondarycontainer);
+  color: var(--td-text-color-secondary);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preprocessed-import-progress {
+  margin-top: 14px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 6px;
+  background: var(--td-brand-color-light);
+  color: var(--td-brand-color);
+  font-size: 13px;
 }
 
 .knowledge-card-upload {

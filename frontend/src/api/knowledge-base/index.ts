@@ -209,6 +209,61 @@ export function createManualKnowledge(
   return post(`/api/v1/knowledge-bases/${kbId}/knowledge/manual`, data);
 }
 
+export interface PreprocessedKnowledgeDocument {
+  doc_id?: string;
+  source_file?: string;
+  source_path?: string;
+  title?: string;
+  doc_title?: string;
+  doc_type?: string;
+  product?: string;
+  language?: string;
+  status?: string;
+  metadata?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface PreprocessedChunk {
+  chunk_id?: string;
+  doc_id?: string;
+  source_file?: string;
+  source_path?: string;
+  heading_path?: string;
+  doc_type?: string;
+  product?: string;
+  module?: string;
+  intent?: string;
+  status?: string;
+  language?: string;
+  title?: string;
+  summary?: string;
+  keywords?: string[];
+  aliases?: string[];
+  unit_type?: string;
+  parent_id?: string;
+  graph_entities?: string[];
+  graph_relations?: Array<Record<string, unknown>>;
+  content?: string;
+  metadata?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface PreprocessedKnowledgeImportRequest {
+  document: PreprocessedKnowledgeDocument;
+  chunks: PreprocessedChunk[];
+  title?: string;
+  file_name?: string;
+  tag_id?: string;
+  channel?: string;
+}
+
+export function importPreprocessedKnowledge(
+  kbId: string,
+  data: PreprocessedKnowledgeImportRequest,
+) {
+  return post(`/api/v1/knowledge-bases/${kbId}/knowledge/chunks`, data);
+}
+
 export function listKnowledgeFiles(
   kbId: string,
   params: {
